@@ -14,8 +14,11 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
+from rich.markup import escape
 
 from ..agent import build_code_engine
+from ..agents.registry import get_agent
+from ..agent import build_engine
 from ..engine import ApprovalOutcome, PermissionRequest
 from ..events import Event, EventType
 from ..conversations import ConversationStore
@@ -82,10 +85,13 @@ class CoworkerApp(App):
         self,
         *,
         workspace: str | Path,
-        model: str = "gpt-5.6-sol",
+        model: str = "ollama:gemma4:31b-cloud",
         mode: Mode = Mode.INTERACTIVE,
         provider: Optional[ProviderClient] = None,
+        persona: str = "code",
         memory_store: Optional[MemoryStore] = None,
+        memory_off: bool = False,
+        user_rules: str = "",
         session_store: Optional[ConversationStore] = None,
         session_id: Optional[str] = None,
         resume_messages: Optional[list[dict]] = None,
@@ -95,7 +101,10 @@ class CoworkerApp(App):
         self.model = model
         self.mode = mode
         self._provider = provider
+        self.persona = persona
         self._memory_store = memory_store
+        self._memory_off = memory_off
+        self._user_rules = user_rules
         self._session_store = session_store
         self._session_id = session_id
         self._resume_messages = resume_messages
@@ -109,26 +118,33 @@ class CoworkerApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.engine = build_code_engine(
+        self.engine = self._build_engine(messages=self._resume_messages)
+        self._write(
+            f"[b]coworker · {escape(self.persona)}[/b]  ·  model {escape(self.model)}  ·  mode {self.mode.value}"
+        )
+        self._write(f"workspace: {escape(str(self.workspace))}")
+        if self._resume_messages:
+            self._write(
+                f"[dim]resumed session {escape(str(self._session_id))} · "
+                f"{len(self._resume_messages)} messages[/dim]"
+            )
+        self._write("Type a request, or /help for commands.\n")
+        self.query_one("#prompt", Input).focus()
+
+    def _build_engine(self, *, messages: Optional[list[dict]] = None):
+        return build_engine(
+            agent=get_agent(self.persona),
             workspace=self.workspace,
             model=self.model,
             mode=self.mode,
             approver=self._approve,
             provider=self._provider,
             memory_store=self._memory_store,
-            messages=self._resume_messages,
+            memory_off=self._memory_off,
+            user_rules=self._user_rules,
+            messages=messages,
+            session_id=self._session_id,
         )
-        self._write(
-            f"[b]coworker · code[/b]  ·  model {self.model}  ·  mode {self.mode.value}"
-        )
-        self._write(f"workspace: {self.workspace}")
-        if self._resume_messages:
-            self._write(
-                f"[dim]resumed session {self._session_id} · "
-                f"{len(self._resume_messages)} messages[/dim]"
-            )
-        self._write("Type a request, or /help for commands.\n")
-        self.query_one("#prompt", Input).focus()
 
     # -- approvals --------------------------------------------------------------
     async def _approve(self, request: PermissionRequest) -> ApprovalOutcome:
@@ -172,9 +188,21 @@ class CoworkerApp(App):
     # -- rendering --------------------------------------------------------------
     def _render_event(self, event: Event) -> None:
         data = event.data
+        # Do not render token/delta events individually. The complete response is
+        # rendered once when ASSISTANT_MESSAGE arrives below.
         if event.type is EventType.ASSISTANT_MESSAGE:
             if data.get("text"):
-                self._write(f"[b green]assistant[/b green]\n{data['text']}")
+                self._write(f"[b green]assistant[/b green]\n{escape(str(data['text']))}")
+        elif event.type is EventType.COMPACTING:
+            self._write("[dim]compacting conversation…[/dim]")
+        elif event.type is EventType.COMPACTED:
+            self._write("[dim]conversation compacted[/dim]")
+        elif event.type is EventType.PLAN_PROPOSED:
+            self._write("[yellow]plan proposed; review the plan before continuing[/yellow]")
+        elif event.type is EventType.DIRECTORY_REQUESTED:
+            self._write("[yellow]additional directory access requested[/yellow]")
+        elif event.type is EventType.QUESTION_REQUESTED:
+            self._write("[yellow]the agent asked a question; this surface cannot answer it automatically[/yellow]")
         elif event.type is EventType.TOOL_PROPOSED:
             self._write(
                 f"[yellow]→ {data['name']}[/yellow] {_short(data.get('arguments'), 100)}"
@@ -208,9 +236,10 @@ class CoworkerApp(App):
             self.exit()
         elif name == "/help":
             self._write(
-                "commands: /mode plan|interactive|auto · /model <id> · /clear · /quit"
+                "commands: /mode discuss|plan|interactive|auto|custom · /model <id> · "
+                "/persona <name> · /status · /clear · /quit"
             )
-        elif name == "/mode" and arg in {"plan", "interactive", "auto"}:
+        elif name == "/mode" and arg in {m.value for m in Mode}:
             self.mode = Mode(arg)
             if self.engine:
                 self.engine.permissions.mode = self.mode
@@ -218,21 +247,25 @@ class CoworkerApp(App):
         elif name == "/model" and arg:
             self.model = arg
             if self.engine:
-                self.engine.model = arg
+                self.engine.switch_model(arg)
             self._write(f"model → {arg}")
+        elif name == "/persona" and arg:
+            try:
+                get_agent(arg)
+                self.persona = arg
+                self._write(f"persona → {arg} (applies to the next cleared session)")
+            except Exception as exc:
+                self._write(f"[red]persona error:[/red] {escape(str(exc))}")
+        elif name == "/status":
+            self._write(f"persona: {self.persona} · model: {self.model} · mode: {self.mode.value} · session: {self._session_id}")
         elif name == "/clear":
             if self.engine:
-                self.engine.messages = []
-                self.engine = build_code_engine(
-                    workspace=self.workspace,
-                    model=self.model,
-                    mode=self.mode,
-                    approver=self._approve,
-                    provider=self._provider,
-                )
+                self.engine = self._build_engine(messages=[])
             self.query_one("#log", RichLog).clear()
             self.rendered.clear()
             self._write("conversation cleared")
+        elif name in {"/interrupt", "/stop"}:
+            self.action_interrupt()
         else:
             self._write(f"[red]unknown command:[/red] {command}")
 

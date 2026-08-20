@@ -15,8 +15,8 @@ Cross-platform: paths are derived from this spec's own location (SPECPATH), neve
 so the same spec builds native binaries on macOS, Windows, and Linux. On Windows PyInstaller
 appends `.exe` to `name`. The binary is built as a normal console app on every OS — a windowed
 (console=False) build leaves sys.stdout/stderr as None, which breaks uvicorn's startup logging
-and hangs the server. To avoid a console window flashing in the desktop app, the Tauri shell
-spawns this sidecar with the Windows CREATE_NO_WINDOW flag (see src-tauri/src/lib.rs), which
+and hangs the server. To avoid a console window flashing for supervised server launches, the server wrapper
+spawns this server with the Windows CREATE_NO_WINDOW flag, which
 hides the window while keeping stdio intact.
 """
 
@@ -70,6 +70,17 @@ if IS_WINDOWS:
     except Exception:
         pass
 
+# [bedrock] extra — boto3 is lazy-imported (bedrock_provider.py) so static analysis
+# misses it, and botocore's service-model JSON data dir only ships via collect_all.
+for pkg in ("boto3", "botocore"):
+    try:
+        d, b, h = collect_all(pkg)
+        datas += d
+        binaries += b
+        hiddenimports += h
+    except Exception:
+        pass
+
 for pkg in ("slack_bolt", "telegram"):  # [messaging] extra — optional
     try:
         hiddenimports += collect_submodules(pkg)
@@ -105,7 +116,7 @@ exe = EXE(
     # target_arch left unset → PyInstaller builds for the host architecture.
 )
 # Onedir: dist/openworker-server/{openworker-server[.exe], _internal/}. The build scripts stage
-# this whole folder into src-tauri/binaries/sidecar/ for Tauri's `resources` bundling.
+# the server distribution folder for local packaging.
 coll = COLLECT(
     exe,
     a.binaries,

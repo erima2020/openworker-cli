@@ -1,4 +1,4 @@
-"""Launch the server with uvicorn. Used by the desktop GUI sidecar and `openworker-server`."""
+"""Launch the optional local API server with uvicorn."""
 
 from __future__ import annotations
 
@@ -16,19 +16,12 @@ from .manager import SessionManager
 
 
 def _exit_when_orphaned() -> None:
-    """When launched as a desktop sidecar (`COWORKER_EXIT_WITH_PARENT=1`), exit if the parent
-    process dies — even on an abrupt kill (e.g. the Tauri dev watcher restarting the app, or a
-    crash) that skips the shell's graceful child-kill. Standalone `openworker-server` runs are
-    unaffected.
+    """Exit when explicitly configured as a child process and its parent dies.
 
-    The GUI passes its own PID in `COWORKER_PARENT_PID`. Watching that explicit PID (not
-    getppid) is what makes this work under PyInstaller onefile, where this process is a
-    *grandchild* of the GUI — the bootloader sits in between, so getppid() points at the
-    bootloader and a re-parenting check never fires when the GUI dies (the bug that leaked
-    a server pair on every app quit).
+    Standalone `openworker-server` runs are unaffected. `COWORKER_PARENT_PID` remains
+    supported for external supervisors, but the terminal CLI does not set it.
 
-    POSIX: poll the PID with kill(pid, 0). Windows: no re-parenting semantics at all, so
-    block on a process handle and exit the moment it signals (i.e. the parent exited).
+    POSIX: poll the PID with kill(pid, 0). Windows: wait on a process handle.
     """
     if os.environ.get("COWORKER_EXIT_WITH_PARENT") != "1":
         return

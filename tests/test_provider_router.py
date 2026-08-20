@@ -372,11 +372,11 @@ def test_set_provider_auto_adds_recommended_when_pulled(tmp_path, monkeypatch):
     monkeypatch.setattr(  # pretend the recommended model is pulled
         mgr,
         "_suggested_models",
-        lambda name: ["qwen3-coder:30b"] if name == "ollama" else [],
+        lambda name: ["gemma4:31b-cloud"] if name == "ollama" else [],
     )
     res = mgr.set_provider("ollama", {"base_url": "http://localhost:11434"})
-    assert res["recommended_model"] == "qwen3-coder:30b"
-    assert "ollama:qwen3-coder:30b" in mgr.get_settings()["models"]
+    assert res["recommended_model"] == "gemma4:31b-cloud"
+    assert "ollama:gemma4:31b-cloud" in mgr.get_settings()["models"]
 
 
 def test_set_provider_skips_recommended_when_not_pulled(tmp_path, monkeypatch):
@@ -386,7 +386,8 @@ def test_set_provider_skips_recommended_when_not_pulled(tmp_path, monkeypatch):
     mgr = SessionManager(data_dir=tmp_path)
     monkeypatch.setattr(mgr, "_suggested_models", lambda name: [])  # nothing pulled
     mgr.set_provider("ollama", {"base_url": "http://localhost:11434"})
-    assert "ollama:qwen3-coder:30b" not in mgr.get_settings()["models"]
+    # The active default is always surfaced even when the model is not pulled.
+    assert "ollama:gemma4:31b-cloud" in mgr.get_settings()["models"]
 
 
 def test_provider_builders(monkeypatch):
@@ -409,12 +410,16 @@ def test_provider_builders(monkeypatch):
     with pytest.raises(RuntimeError, match="Gemini"):
         build_provider_client("gemini", {}, None)._ensure_client()
 
-    # OpenAI custom endpoint (Azure /openai/v1, OpenRouter, vLLM, …) passes through
+    # OpenAI custom endpoint (Azure /openai/v1, OpenRouter, vLLM, …) passes through and
+    # keeps Chat Completions; a blank endpoint means stock OpenAI → the Responses API.
+    from coworker.providers import OpenAIResponsesProvider
+
     o = build_provider_client(
         "openai", {"base_url": "https://my.azure.example/openai/v1"}, None
     )
+    assert isinstance(o, OpenAIProvider)
     assert o._base_url == "https://my.azure.example/openai/v1"
-    assert build_provider_client("openai", {}, None)._base_url is None
+    assert isinstance(build_provider_client("openai", {}, None), OpenAIResponsesProvider)
 
 
 def test_anthropic_gemini_capabilities():
@@ -459,16 +464,16 @@ def test_first_configured_provider_wins_default(tmp_path, monkeypatch):
 
     mgr = SessionManager(data_dir=tmp_path)
     assert (
-        mgr.model == "gpt-5.6-sol"
-    )  # fresh install: built-in default, openai unconfigured
+        mgr.model == "ollama:gemma4:31b-cloud"
+    )  # fresh install: built-in Ollama default
 
-    # the first provider that gets a key takes over the default
+    # The local Ollama default remains selected when a cloud provider is configured.
     mgr.set_provider("anthropic", {"api_key": "sk-ant-x"})
-    assert mgr.model == "anthropic:claude-fable-5"
+    assert mgr.model == "ollama:gemma4:31b-cloud"
 
-    # but a default that already works is never stolen by the next provider
+    # A working default is never stolen by the next provider.
     mgr.set_provider("gemini", {"api_key": "AIza-x"})
-    assert mgr.model == "anthropic:claude-fable-5"
+    assert mgr.model == "ollama:gemma4:31b-cloud"
 
 
 def test_surface_visibility(tmp_path, monkeypatch):

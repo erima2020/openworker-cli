@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# One-time dev bootstrap for a fresh checkout: creates the Python venv every
-# from-source flow expects at .venv — the browser dev flow runs its
-# openworker-server directly, and the Tauri desktop shell falls back to it when
-# no packaged sidecar binary is present (src-tauri/src/lib.rs, resolution step 3).
+# One-time terminal/server bootstrap for a fresh checkout: creates the Python
+# virtual environment every from-source flow expects at .venv.
 #
 # Usage: bash packaging/setup_dev_env.sh
 set -euo pipefail

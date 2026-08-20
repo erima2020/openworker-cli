@@ -9,7 +9,10 @@ workspace path. Other permission grants remain global-only.
 
 from __future__ import annotations
 
-import tomllib
+try:
+    import tomllib  # stdlib since 3.11
+except ModuleNotFoundError:  # 3.10, the floor requires-python declares
+    import tomli as tomllib  # type: ignore[no-redef]
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -26,7 +29,7 @@ DEFAULT_ALLOWED_COMMANDS: list[str] = []
 
 @dataclass
 class Config:
-    model: str = "gpt-5.6-sol"
+    model: str = "ollama:gemma4:31b-cloud"
     mode: str = "interactive"
     max_iterations: int = 150
     allowed_commands: list[str] = field(

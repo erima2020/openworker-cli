@@ -51,6 +51,7 @@ from ..connectors import (
     load_settings,
     make_adapter,
     set_experimental_enabled,
+    slack_split,
     update_connector_tools,
 )
 from ..connectors.browser_automation import (
@@ -68,19 +69,25 @@ from ..mcp import (
     put_global_server,
     read_global,
 )
-from ..memory import MemoryStore, Scope, SQLiteMemoryStore
+from ..memory import MemorySettingsStore, MemoryStore, Scope, SQLiteMemoryStore
 from ..permissions import Mode
 from ..agents import list_agents as _list_agents
 from ..providers import (
     ProviderClient,
     ProviderRouter,
+    descriptor_configured,
     get_descriptor,
     provider_descriptors,
     verify_provider_key,
 )
 from ..secrets import SecretStore, state_dir
 from ..sessions import SessionRecord
-from ..skills import SkillLoader
+from ..skills import (
+    SessionSkillStore,
+    SkillLoader,
+    SkillStore,
+    effective_skills,
+)
 
 _SCOPES = {s.value for s in Scope}
 
@@ -109,7 +116,7 @@ class SessionManager:
         *,
         workspace: Optional[str | Path] = None,  # default/seed workspace (e.g. --cwd)
         data_dir: Optional[str | Path] = None,
-        model: str = "gpt-5.6-sol",
+        model: str = "ollama:gemma4:31b-cloud",
         mode: Mode = Mode.INTERACTIVE,
         provider: Optional[ProviderClient] = None,
     ) -> None:
@@ -129,6 +136,9 @@ class SessionManager:
         base.mkdir(parents=True, exist_ok=True)
 
         self.memory_store: MemoryStore = SQLiteMemoryStore(base / "coworker.db")
+        # MEMORY-SPEC §4.3/§6: the on/off switch + the user's standing rules. Settings-
+        # level, outside the memory table; read at engine build time.
+        self.memory_settings = MemorySettingsStore(base / "memory-settings.json")
         self.audit_store = AuditStore(base / "coworker.db")
         self.session_store = ConversationStore(base)
         self.session_store.canonicalize_workspaces()  # collapse /tmp vs /private/tmp etc.
@@ -223,6 +233,11 @@ class SessionManager:
         self.session_connections = SessionConnectionStore(
             base / "session_connections.json"
         )
+        # Skills (SKILLS-SPEC §4): folder-backed CRUD + per-session mutes. The effective menu
+        # gates the engine's skill catalog the same way effective_connectors gates connector
+        # tools — one resolver feeds the catalog injection, the rail, and the composer popup.
+        self.skill_store = SkillStore()
+        self.session_skills = SessionSkillStore(base / "session_skills.json")
         # Dead-letter: inbound messages with no destination + background-turn failures, so neither
         # vanishes silently (a debugging/visibility surface, not a redelivery queue).
         self.unrouted = UnroutedStore(base / "unrouted.json")
@@ -273,6 +288,14 @@ class SessionManager:
             "trusted": trusted,
             "required": bool(commands and not trusted),
         }
+
+    def _mcp_workspace_trusted(self, workspace: Optional[str | Path]) -> bool:
+        """Whether workspace `.coworker/mcp.json` may be loaded (#213).
+
+        Same consent boundary as repository ``allowed_commands``: an untrusted
+        clone must not define stdio processes that spawn at session open.
+        """
+        return bool(workspace and self.workspace_trust.is_trusted(workspace))
 
     def set_workspace_trust(
         self, path: str | Path, *, trusted: bool
@@ -420,7 +443,18 @@ class SessionManager:
             model=model,
             mode=mode,
             provider=self.provider,
+            # Memory off (§4.3) = stop LEARNING, not amnesia: saved facts still inject
+            # and stay usable, only the write tools go. Read at build time; running
+            # sessions finish under the mode they started with.
             memory_store=self.memory_store,
+            memory_off=not self.memory_settings.enabled,
+            # LIVE, not a snapshot: turning saving off mid-conversation must take
+            # effect at once (owner-hit 2026-07-28 — a running session kept saving).
+            memory_saving_enabled=lambda: self.memory_settings.enabled,
+            # Callable, not a snapshot: editing your instructions in Settings applies
+            # to conversations already open (same reason as the saving switch).
+            user_rules=lambda: self.memory_settings.user_rules,
+            on_memory_saved=self._memory_saved_notifier(session_id),
             messages=messages,
             extra_tools=extra_tools,
             secrets=self.secrets,
@@ -444,6 +478,9 @@ class SessionManager:
             routing_targets=self._routing_targets(session_id, agent),
             # Per-session connection hierarchy: expose only effective-enabled connectors' tools.
             connector_filter=self.effective_connectors(session_id, agent_name),
+            # Per-session skill menu, LIVE (SKILLS-SPEC §3): a callable so load_skill sees
+            # disables/new skills immediately; the catalog snapshot is taken at build.
+            skill_filter=lambda sid=session_id, w=ws: self.effective_skill_names(sid, w),
         )
         # An automation run rebuilt here (manual "Run now" over WS, durable resume) still
         # carries its task's standing allowances — the rules live on the task record.
@@ -458,6 +495,13 @@ class SessionManager:
             )
         if record is not None and record.grants:
             self._apply_grants(engine, record.grants)
+        # Auto-compaction (OPE-27): restore the persisted view boundary and wire the live
+        # Settings getter — post-construction, so build_engine's signature stays put.
+        if record is not None and record.compaction:
+            from ..compaction import CompactionState
+
+            engine.compaction_state = CompactionState.from_dict(record.compaction)
+        engine.compaction_settings = self.compaction_settings
         self._engines[session_id] = engine
         if is_new_session:
             self._emit_session_created(session_id, agent_name)
@@ -721,27 +765,26 @@ class SessionManager:
         async def ask(
             args: dict[str, Any], tool_call_id: Optional[str] = None
         ) -> dict[str, Any]:
-            question = str(args.get("question", "")).strip()
-            if not question:
+            from ..tools.ask import answer_result, question_item_fields
+
+            fields = question_item_fields(args)
+            if fields is None:
                 return {"answer": "", "error": "no question"}
             inbox_name = self.inbox_routing.route_for(session_id, agent)
             item = self.inbox.add_question(
                 session_id,
-                title=question,
                 inbox=inbox_name,
-                options=list(args.get("options") or []),
-                allow_text=bool(args.get("allow_text", True)),
-                multi=bool(args.get("multi", False)),
                 tool_call_id=tool_call_id,
+                **fields,
             )
             if (
                 item.state != "pending"
             ):  # durable resume re-raised an already-answered prompt
-                return {"answer": item.resolution or ""}
+                return answer_result(item.questions, item.resolution)
             self.persist_session(session_id)  # the pending tool call is now on disk
             await self.mirror_inbox_item(item)
             answer = await self.inbox.wait(item.id)
-            return {"answer": answer}
+            return answer_result(item.questions, answer)
 
         return ask
 
@@ -879,7 +922,11 @@ class SessionManager:
         loop = asyncio.get_running_loop()
         effective: Optional[set[str]] = None  # computed lazily, once
         out: list[Any] = []
-        for server in load_mcp_servers(ws, secrets=self.secrets):
+        for server in load_mcp_servers(
+            ws,
+            secrets=self.secrets,
+            workspace_trusted=self._mcp_workspace_trusted(ws),
+        ):
             if not server.enabled:
                 continue
             if server.auth == "oauth" and not mcp_oauth.has_tokens(
@@ -995,7 +1042,11 @@ class SessionManager:
         """Connect one server NOW — for OAuth servers this may open the browser and wait
         for the loopback callback, so callers run it as a background task and watch
         list_mcp for the status flip."""
-        for server in load_mcp_servers(self.default_workspace, secrets=self.secrets):
+        for server in load_mcp_servers(
+            self.default_workspace,
+            secrets=self.secrets,
+            workspace_trusted=self._mcp_workspace_trusted(self.default_workspace),
+        ):
             if server.name != name:
                 continue
             self._mcp_authorizing.add(name)
@@ -1073,7 +1124,11 @@ class SessionManager:
 
     async def mcp_tools(self, name: str) -> dict[str, Any]:
         """Connect one server and list its tools (name + description)."""
-        for server in load_mcp_servers(self.default_workspace, secrets=self.secrets):
+        for server in load_mcp_servers(
+            self.default_workspace,
+            secrets=self.secrets,
+            workspace_trusted=self._mcp_workspace_trusted(self.default_workspace),
+        ):
             if server.name == name:
                 try:
                     conn = await self.mcp.ensure(server)
@@ -1126,10 +1181,18 @@ class SessionManager:
                 u: self._people.get(f"{c['name']}:{u}")
                 for u in (c.get("allowed_users") or [])
             }
+            c["approval_owner_names"] = {
+                u: self._people.get(f"{c['name']}:{u}")
+                for u in (c.get("approval_owner_ids") or [])
+            }
             for w in c.get("workspaces") or []:
                 w["allowed_user_names"] = {
                     u: self._people.get(f"{c['name']}:{u}")
                     for u in (w.get("allowed_users") or [])
+                }
+                w["approval_owner_names"] = {
+                    u: self._people.get(f"{c['name']}:{u}")
+                    for u in (w.get("approval_owner_ids") or [])
                 }
         return connectors
 
@@ -1213,39 +1276,47 @@ class SessionManager:
             ".doc",
             ".docm",
         }
-        for path in root.rglob("*"):
-            try:
-                rel = path.relative_to(root)
-                if any(
-                    part.startswith(".")
-                    or part in {"node_modules", "target", "dist", "__pycache__"}
-                    for part in rel.parts
-                ):
+        # os.walk with in-place pruning, NOT rglob: rglob descends first and filters after,
+        # so a home-directory workspace walked into ~/Library and tripped the macOS App Data
+        # TCC prompt ("OpenWorker would like to access data from other apps") on every turn.
+        # Pruning here means those directories are never entered at all.
+        from ..tools.search import OS_DATA_DIRS
+
+        skip = {"node_modules", "target", "dist", "__pycache__"} | OS_DATA_DIRS
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in skip]
+            for name in files:
+                if name.startswith("."):
                     continue
-                if not path.is_file() or path.suffix.lower() not in suffixes:
+                path = Path(dirpath) / name
+                if path.suffix.lower() not in suffixes:
                     continue
-                st = path.stat()
-                out.append(
-                    {
-                        "path": str(rel),
-                        # Absolute path for "Copy path" — the relative one is useless outside
-                        # the app (tester catch 2026-07-12: it copied just the filename).
-                        "abs_path": str(path),
-                        "name": path.name,
-                        "kind": _artifact_kind(path),
-                        "size": st.st_size,
-                        "modified_at": st.st_mtime,
-                    }
-                )
-            except OSError:
-                continue
+                try:
+                    st = path.stat()
+                    if not path.is_file():
+                        continue
+                    out.append(
+                        {
+                            "path": str(path.relative_to(root)),
+                            # Absolute path for "Copy path" — the relative one is useless
+                            # outside the app (tester catch 2026-07-12: it copied just the
+                            # filename).
+                            "abs_path": str(path),
+                            "name": path.name,
+                            "kind": _artifact_kind(path),
+                            "size": st.st_size,
+                            "modified_at": st.st_mtime,
+                        }
+                    )
+                except OSError:
+                    continue
         out.sort(key=lambda a: a["modified_at"], reverse=True)
         return out[:80]
 
     MAX_BINARY_PREVIEW = 25 * 1024 * 1024  # base64-over-JSON gets heavy past this
 
     def _artifact_target(
-        self, session_id: str, path: str
+        self, session_id: str, path: str, *, allow_dir: bool = False
     ) -> tuple[Optional[Path], Optional[str]]:
         """Resolve an artifact path under the session's workspace, or (None, error)."""
         record = self.session_store.load(session_id)
@@ -1258,14 +1329,36 @@ class SessionManager:
             target.relative_to(root)
         except ValueError:
             return None, "path escapes workspace"
+        if allow_dir and target.is_dir():
+            return target, None
         if not target.is_file():
-            return None, "not found"
+            return None, (
+                "This isn't in the conversation's folder anymore — it may have been "
+                "moved or deleted."
+            )
         return target, None
 
     def read_artifact(self, session_id: str, path: str) -> dict[str, Any]:
-        target, err = self._artifact_target(session_id, path)
+        # Folders are readable too (a model sometimes links a whole package, e.g. a skill
+        # build dir): return a listing the viewer can render instead of a dead end.
+        target, err = self._artifact_target(session_id, path, allow_dir=True)
         if target is None:
             return {"ok": False, "error": err}
+        if target.is_dir():
+            entries: list[dict[str, Any]] = []
+            try:
+                children = sorted(
+                    target.iterdir(), key=lambda c: (c.is_file(), c.name.lower())
+                )
+            except OSError as exc:
+                return {"ok": False, "error": str(exc)}
+            for child in children[:500]:
+                try:
+                    size = 0 if child.is_dir() else child.stat().st_size
+                except OSError:
+                    continue
+                entries.append({"name": child.name, "dir": child.is_dir(), "size": size})
+            return {"ok": True, "path": path, "kind": "folder", "entries": entries}
         kind = _artifact_kind(target)
         if kind == "office":
             # PowerPoint/Word binaries can't be previewed inline; the UI offers
@@ -1319,27 +1412,29 @@ class SessionManager:
         import subprocess
         import sys
 
-        target, err = self._artifact_target(session_id, path)
+        target, err = self._artifact_target(session_id, path, allow_dir=True)
         if target is None:
             return {"ok": False, "error": err}
+        # A folder "opens" as itself in the file manager, whatever the mode.
+        is_dir = target.is_dir()
         try:
             if sys.platform == "darwin":
                 args = (
                     ["open", "-R", str(target)]
-                    if mode == "reveal"
+                    if mode == "reveal" and not is_dir
                     else ["open", str(target)]
                 )
                 subprocess.Popen(
                     args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
             elif sys.platform == "win32":
-                if mode == "reveal":
+                if mode == "reveal" and not is_dir:
                     # Explorer wants the path glued to the switch: /select,<path>
                     subprocess.Popen(["explorer", f"/select,{target}"])
                 else:
                     os.startfile(str(target))  # type: ignore[attr-defined]  # open in default app
             else:  # Linux/BSD
-                tgt = str(target.parent) if mode == "reveal" else str(target)
+                tgt = str(target.parent) if mode == "reveal" and not is_dir else str(target)
                 subprocess.Popen(
                     ["xdg-open", tgt],
                     stdout=subprocess.DEVNULL,
@@ -1382,17 +1477,10 @@ class SessionManager:
         """Descriptor + per-provider status for the Settings UI. Never returns secret values;
         non-secret field values (e.g. the Ollama base URL) ARE returned so the form can prefill.
         """
-        import os
-
         out: list[dict[str, Any]] = []
         for d in provider_descriptors():
             profile = self.secrets.get(f"provider:{d.name}") or {}
-            if d.needs_key:
-                configured = bool(profile.get("api_key")) or bool(
-                    d.env_key and os.environ.get(d.env_key)
-                )
-            else:
-                configured = True  # keyless (Ollama) — usable out of the box
+            configured = descriptor_configured(d, profile)
             values = {
                 f.key: profile.get(f.key)
                 for f in d.fields
@@ -1557,8 +1645,8 @@ class SessionManager:
         self, name: str, fields: Optional[dict[str, Any]]
     ) -> dict[str, Any]:
         """Test a provider's credentials with a live read-only call, WITHOUT persisting them, so
-        onboarding can offer a "Test" button. Falls back to the stored/env key when the form left
-        the key blank (e.g. testing an already-configured provider)."""
+        onboarding can offer a "Test" button. Falls back to stored/env values when the form left
+        a field blank (e.g. testing an already-configured provider)."""
         import os
 
         d = get_descriptor(name)
@@ -1566,13 +1654,28 @@ class SessionManager:
             return {"ok": False, "error": f"unknown provider: {name}"}
         fields = fields or {}
         profile = self.secrets.get(f"provider:{name}") or {}
-        api_key = (fields.get("api_key") or profile.get("api_key") or "").strip()
+        merged = {}
+        for f in d.fields:
+            val = fields.get(f.key) or profile.get(f.key) or ""
+            if isinstance(val, str):
+                val = val.strip()
+            if val:
+                merged[f.key] = val
+        api_key = merged.get("api_key", "")
         if not api_key and d.env_key:
             api_key = os.environ.get(d.env_key, "").strip()
-        base_url = (fields.get("base_url") or profile.get("base_url") or "").strip()
-        if d.needs_key and not api_key:
+        has_key_field = any(f.key == "api_key" for f in d.fields)
+        if d.needs_key and has_key_field and not api_key:
             return {"ok": False, "error": "Enter an API key to test."}
-        return verify_provider_key(name, api_key=api_key, base_url=base_url)
+        if d.needs_key and not has_key_field:
+            # Multi-field cloud providers (Bedrock): required fields must be present;
+            # actual credentials may be ambient (~/.aws, env) and are checked by the call.
+            missing = [f.label for f in d.fields if f.required and not merged.get(f.key)]
+            if missing:
+                return {"ok": False, "error": "missing: " + ", ".join(missing)}
+        return verify_provider_key(
+            name, api_key=api_key, base_url=merged.get("base_url", ""), fields=merged
+        )
 
     def _model_provider(self, model: str) -> str:
         """The provider a model string routes to (known `prefix:` or the OpenAI default)."""
@@ -1586,12 +1689,7 @@ class SessionManager:
         d = get_descriptor(name)
         if d is None:
             return False
-        if not d.needs_key:
-            return True  # keyless (Ollama)
-        profile = self.secrets.get(f"provider:{name}") or {}
-        return bool(profile.get("api_key")) or bool(
-            d.env_key and os.environ.get(d.env_key)
-        )
+        return descriptor_configured(d, self.secrets.get(f"provider:{name}") or {})
 
     # -- settings / prefs (model API key, default model, onboarding) -------------
     def _prefs_path(self) -> Path:
@@ -1742,7 +1840,7 @@ class SessionManager:
         selectable = [m for m in self._curated_models() if _selectable(m)]
         if self.model not in selectable:
             selectable.insert(0, self.model)
-        from ..providers.matrix import model_labels
+        from ..providers.matrix import model_context_windows, model_labels
 
         return {
             "provider": "openai",
@@ -1751,6 +1849,9 @@ class SessionManager:
             # Curated-matrix display names ({full id → "GLM-5.2 · via Together"}) so every
             # picker shows human labels; custom models absent here render their raw id.
             "model_labels": model_labels(),
+            # {full id → context window in tokens}, verified matrix entries only —
+            # drives the composer's context-fill meter (absent id → meter hides).
+            "model_context_windows": model_context_windows(),
             "has_key": env_key or stored,
             # Provider-agnostic "can this default model actually run?" — true when the default
             # model's provider is configured (any provider, not just OpenAI). Drives the GUI's
@@ -1762,12 +1863,14 @@ class SessionManager:
             "surfaces": self._surfaces(),
             "nav_layout": self._nav_layout(),
             "sessions_peek": self.sessions_peek(),
+            "context_bar": self.context_bar(),
             "scratch_base": self._prefs.get("scratch_base")
             or self.DEFAULT_SCRATCH_BASE,
             # Real on-disk secrets location, so the UI shows the OS-native path instead of a
             # hardcoded POSIX one (Windows -> %APPDATA%\coworker, macOS/Linux -> ~/.config).
             "secrets_path": str(self.secrets.path),
             **self.pdf_settings(),
+            **self.compaction_settings_payload(),
         }
 
     def _surfaces(self) -> dict[str, bool]:
@@ -1820,6 +1923,16 @@ class SessionManager:
         self._save_prefs()
         return {"ok": True, "sessions_peek": self.sessions_peek()}
 
+    def context_bar(self) -> bool:
+        """Whether the composer shows the context-window fill bar. OFF by default (owner
+        ask): the chip then states the session total, and the popover keeps both numbers."""
+        return bool(self._prefs.get("context_bar", False))
+
+    def set_context_bar(self, shown: Any) -> dict[str, Any]:
+        self._prefs["context_bar"] = bool(shown)
+        self._save_prefs()
+        return {"ok": True, "context_bar": self.context_bar()}
+
     # -- PDF attachments / token savings (owner ask, 2026-07-17) ----------------
     DEFAULT_PDF_MAX_PAGES = 20
     DEFAULT_PDF_MAX_MB = 10
@@ -1843,6 +1956,65 @@ class SessionManager:
             "pdf_max_pages": max(1, min(pages, 100)),
             "pdf_max_mb": max(1, min(mb, 10)),
         }
+
+    def compaction_settings(self) -> dict[str, Any]:
+        """The live auto-compaction knobs (OPE-27) — read by every engine per check, so a
+        Settings change applies without a rebuild. Only the two spec'd overrides plus the
+        summarizer-model pin; absent keys fall back to compaction.py defaults."""
+        from ..compaction import DEFAULT_CAP_TOKENS, DEFAULT_THRESHOLD_PCT
+
+        return {
+            "threshold_pct": float(
+                self._prefs.get("compaction_threshold_pct") or DEFAULT_THRESHOLD_PCT
+            ),
+            "cap_tokens": int(
+                self._prefs.get("compaction_cap_tokens") or DEFAULT_CAP_TOKENS
+            ),
+            # "" → the session's own model (engine falls back to self.model).
+            "model": str(self._prefs.get("compaction_model") or ""),
+        }
+
+    def compaction_settings_payload(self) -> dict[str, Any]:
+        """The same knobs under REST-facing names (prefixed to keep /v1/settings flat)."""
+        settings = self.compaction_settings()
+        return {
+            "compaction_threshold_pct": settings["threshold_pct"],
+            "compaction_cap_tokens": settings["cap_tokens"],
+            "compaction_model": settings["model"],
+        }
+
+    def set_compaction_settings(
+        self,
+        threshold_pct: Any = None,
+        cap_tokens: Any = None,
+        model: Any = None,
+    ) -> dict[str, Any]:
+        """Persist the auto-compaction overrides (OPE-27). Threshold is a percentage of
+        the model's context window (10–95); the cap is an absolute token ceiling; model
+        pins the summarizer ('' → the session's own model). Engines read these live via
+        `compaction_settings()`, so changes apply to running sessions immediately."""
+        if threshold_pct is not None:
+            try:
+                pct = float(threshold_pct)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "compaction_threshold_pct must be a number"}
+            if not 0.10 <= pct <= 0.95:
+                return {
+                    "ok": False,
+                    "error": "compaction_threshold_pct must be between 0.10 and 0.95",
+                }
+            self._prefs["compaction_threshold_pct"] = pct
+        if cap_tokens is not None:
+            try:
+                self._prefs["compaction_cap_tokens"] = max(
+                    10_000, min(int(cap_tokens), 2_000_000)
+                )
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "compaction_cap_tokens must be a number"}
+        if model is not None:
+            self._prefs["compaction_model"] = str(model)
+        self._save_prefs()
+        return {"ok": True, **self.compaction_settings()}
 
     def set_pdf_settings(
         self,
@@ -1935,7 +2107,142 @@ class SessionManager:
     def disallow_user(
         self, name: str, user_id: str, team_id: Optional[str] = None
     ) -> dict[str, Any]:
+        if name == "slack" and user_id in self.slack_approval_owner_ids(team_id):
+            return {
+                "ok": False,
+                "error": "Remove this person as an approval owner first.",
+            }
         return self._set_allowed(name, user_id, team_id=team_id, add=False)
+
+    def slack_approval_owner_ids(self, team_id: Optional[str] = None) -> set[str]:
+        """Stable Slack user ids allowed to resolve consequential Inbox prompts.
+
+        Managed relay installs are installer-owned. Manual Socket Mode has no
+        human OAuth identity, so its owners are selected explicitly.
+        """
+        key = f"slack:team:{team_id}" if team_id else "slack:default"
+        profile = self.secrets.get(key) or {}
+        if team_id:
+            installer = str(profile.get("slack_user_id") or "").strip()
+            return {installer} if installer else set()
+        if profile.get("mode") == "relay":
+            return set()
+        return {
+            str(user_id).strip()
+            for user_id in (profile.get("approval_owner_ids") or [])
+            if str(user_id).strip()
+        }
+
+    def set_slack_approval_owner(
+        self, user_id: str, *, add: bool, display_name: str = ""
+    ) -> dict[str, Any]:
+        """Edit Manual Socket Mode approval owners.
+
+        Owner status implies inbound permission. Relay ownership is derived from
+        the OAuth installer and is intentionally not editable here.
+        """
+        user_id = str(user_id).strip()
+        if not user_id:
+            return {"ok": False, "error": "user_id required"}
+        profile = self.secrets.get("slack:default")
+        if not profile:
+            return {"ok": False, "error": "Slack is not connected in Manual mode."}
+        if profile.get("mode") == "relay" or profile.get("managed"):
+            return {
+                "ok": False,
+                "error": "Relay approval ownership is set by the Slack installer.",
+            }
+
+        owners = self.slack_approval_owner_ids()
+        if add:
+            owners.add(user_id)
+        else:
+            owners.discard(user_id)
+            if not owners and self._has_manual_slack_inbox_binding():
+                return {
+                    "ok": False,
+                    "error": (
+                        "Choose another approval owner before removing the last one "
+                        "while Slack Inbox routing is active."
+                    ),
+                }
+        profile["approval_owner_ids"] = sorted(owners)
+        if add:
+            allowed = set(profile.get("allowed_users") or [])
+            allowed.add(user_id)
+            profile["allowed_users"] = sorted(allowed)
+        self.secrets.put("slack:default", profile)
+        if display_name:
+            self._note_person("slack", user_id, display_name)
+        if self.gateway is not None and "slack" in self.gateway.settings:
+            self.gateway.settings["slack"].allowed_users = set(
+                profile.get("allowed_users") or []
+            )
+        return {
+            "ok": True,
+            "approval_owner_ids": sorted(owners),
+            "allowed_users": list(profile.get("allowed_users") or []),
+        }
+
+    def _has_manual_slack_inbox_binding(self) -> bool:
+        for raw in self.inbox_routing.bindings():
+            if raw.get("channel") != "slack":
+                continue
+            team_id, _ = slack_split(str(raw.get("target") or ""))
+            if team_id is None:
+                return True
+        return False
+
+    def _slack_actor_owns_item(
+        self,
+        item,
+        *,
+        actor_id: str,
+        chat_id: str,
+        team_id: Optional[str],
+    ) -> bool:
+        """Authorize a Slack resolution against both its owner and delivery binding."""
+        event_team, event_channel = slack_split(chat_id)
+        event_team = team_id or event_team
+        binding = self.inbox_routing.binding_for(item.inbox)
+        owner_team = event_team
+        if binding.channel == "slack":
+            owner_team, bound_channel = slack_split(binding.target)
+            if owner_team != event_team or bound_channel != event_channel:
+                return False
+        return bool(actor_id) and actor_id in self.slack_approval_owner_ids(owner_team)
+
+    def set_inbox_binding(
+        self, name: str, *, channel: Optional[str], target: str
+    ) -> dict[str, Any]:
+        """Persist an Inbox transport after validating its approval identity."""
+        channel = str(channel or "").strip() or None
+        target = str(target or "").strip()
+        if channel and not target:
+            return {"ok": False, "error": "Choose a destination channel."}
+        if channel == "slack":
+            settings = load_settings(self.secrets).get("slack")
+            if settings is None or not settings.enabled:
+                return {"ok": False, "error": "Slack is not connected."}
+            team_id, destination = slack_split(target)
+            if not destination:
+                return {"ok": False, "error": "Choose a destination channel."}
+            key = f"slack:team:{team_id}" if team_id else "slack:default"
+            if not self.secrets.get(key):
+                return {
+                    "ok": False,
+                    "error": "That Slack workspace is not connected.",
+                }
+            if not self.slack_approval_owner_ids(team_id):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Choose at least one approval owner in Slack settings before "
+                        "routing Inbox requests there."
+                    ),
+                }
+        self.inbox_routing.set_binding(name, channel=channel, target=target)
+        return {"ok": True, "bindings": self.inbox_routing.bindings()}
 
     def _set_allowed(
         self, name: str, user_id: str, *, team_id: Optional[str] = None, add: bool
@@ -2433,6 +2740,12 @@ class SessionManager:
             approver=self._scheduled_approver(task, session_id),
             provider=self.provider,
             memory_store=self.memory_store,
+            memory_off=not self.memory_settings.enabled,
+            memory_saving_enabled=lambda: self.memory_settings.enabled,
+            # Callable, not a snapshot: editing your instructions in Settings applies
+            # to conversations already open (same reason as the saving switch).
+            user_rules=lambda: self.memory_settings.user_rules,
+            on_memory_saved=self._memory_saved_notifier(session_id),
             secrets=self.secrets,
             # No scheduling tools inside a scheduled run: the executing agent's job is to DO the
             # task, and instructions that mention timing ("every day at 5:32pm…") otherwise tempt
@@ -2443,6 +2756,9 @@ class SessionManager:
             # Scheduled runs respect the same per-session connection hierarchy as live sessions:
             # expose only the persona's effective-enabled connectors' tools (§4.3).
             connector_filter=self.effective_connectors(session_id, task.agent),
+            skill_filter=lambda sid=session_id, w=task.workspace: (
+                self.effective_skill_names(sid, w)
+            ),
         )
         self._seed_task_permissions(engine, task)
         return engine
@@ -2458,6 +2774,12 @@ class SessionManager:
         binding = self.inbox_routing.binding_for(item.inbox)
         if not (binding.channel and self.gateway is not None):
             return
+        if binding.channel == "slack":
+            team_id, _ = slack_split(binding.target)
+            # Legacy bindings may predate approval ownership. Keep the item
+            # available in-app, but never mirror it to an ownerless channel.
+            if not self.slack_approval_owner_ids(team_id):
+                return
         target = f"{binding.channel}:{binding.target}"
         body = "\n".join(p for p in (item.title, item.body) if p).strip()
         buttons = buttons_for(item)
@@ -2484,10 +2806,29 @@ class SessionManager:
             return
         item_id, resolution = decoded
         item = self.inbox.get(item_id)
+        if item is None:
+            return
+        protected_kinds = {"approval", "directory", "plan"}
+        if (
+            getattr(event, "platform", "") == "slack"
+            and item.kind in protected_kinds
+        ):
+            actor_id = str(getattr(event, "user_id", "") or "")
+            if not self._slack_actor_owns_item(
+                item,
+                actor_id=actor_id,
+                chat_id=getattr(event, "chat_id", "") or "",
+                team_id=getattr(event, "team_id", None),
+            ):
+                if self.gateway is not None:
+                    await self.gateway.reject_interaction(event)
+                return
         already = item is not None and item.state != "pending"
-        await self.resolve_inbox(item_id, resolution)
+        resolved = await self.resolve_inbox(item_id, resolution)
+        if not resolved and not already:
+            return
         who = getattr(event, "user_name", None) or "someone"
-        title = item.title if item is not None else "Prompt"
+        title = item.title
         outcome = "already resolved" if already else f"“{resolution}” — by {who}"
         if self.gateway is not None and getattr(event, "message_id", None):
             try:
@@ -2508,7 +2849,26 @@ class SessionManager:
         from ..inbox_routing import resolve_from_reply
 
         text = getattr(event, "text", "") or ""
-        return resolve_from_reply(text, self.inbox.resolve) is not None
+
+        def _resolve(item_id: str, resolution: str) -> bool:
+            item = self.inbox.get(item_id)
+            if item is None:
+                return False
+            if (
+                getattr(event.source, "platform", "") == "slack"
+                and item.kind in {"approval", "directory", "plan"}
+            ):
+                actor_id = str(getattr(event.source, "user_id", "") or "")
+                if not self._slack_actor_owns_item(
+                    item,
+                    actor_id=actor_id,
+                    chat_id=getattr(event.source, "chat_id", "") or "",
+                    team_id=getattr(event.source, "team_id", None),
+                ):
+                    return False
+            return self.inbox.resolve(item_id, resolution)
+
+        return resolve_from_reply(text, _resolve) is not None
 
     # -- self-wake resumption ---------------------------------------------------
     async def resume_due_wakes(self) -> int:
@@ -3054,6 +3414,11 @@ class SessionManager:
                 agent=getattr(engine, "agent_name", "code"),
                 extra_roots=self._extra_roots_of(engine),
                 grants=_grants_of(engine),
+                compaction=(
+                    engine.compaction_state.as_dict()
+                    if getattr(engine, "compaction_state", None)
+                    else {}
+                ),
             )
         )
 
@@ -3377,6 +3742,8 @@ class SessionManager:
         self.mention_sessions.remove_session(session_id)
         # ...and drops its per-session connector overrides (§4.2, like subscriptions).
         self.session_connections.remove_session(session_id)
+        # ...and its per-session skill mutes (SKILLS-SPEC §3 — mutes die with the session).
+        self.session_skills.remove_session(session_id)
         # ...and closes its pending Inbox items — an orphaned approval/question can never be
         # meaningfully answered (owner call, 2026-07-03).
         self.inbox.resolve_session(session_id)
@@ -3452,23 +3819,258 @@ class SessionManager:
     def list_agents(self) -> list[dict[str, Any]]:
         return _list_agents()
 
-    def list_skills(self) -> list[dict[str, Any]]:
-        loader = SkillLoader([state_dir() / "skills"])
-        return loader.catalog()
+    # -- skills (SKILLS-SPEC §4.4) ------------------------------------------------
+    def list_skills(self, workspace: Optional[str] = None) -> list[dict[str, Any]]:
+        """Enriched rows for the Settings screen (scope/source/enabled). Optional workspace
+        adds that project's skills, with project copies shadowing same-named global ones."""
+        return self.skill_store.rows(workspace or None)
+
+    def reveal_skill(
+        self, name: str, workspace: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Open the skill's folder in the OS file manager (§6 "Show folder" — the power-user
+        window into folder-is-truth). Same local-machine rationale as reveal_artifact."""
+        import subprocess
+        import sys
+
+        try:
+            folder, _scope = self.skill_store.find(name, workspace or None)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(
+                    ["open", str(folder)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif sys.platform == "win32":
+                import os
+
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(
+                    ["xdg-open", str(folder)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def effective_skill_names(
+        self, session_id: str, workspace: Optional[str | Path] = None
+    ) -> set[str]:
+        """The session's skill menu (§3): merged scopes − Settings disables − session mutes.
+        The single resolver behind the engine catalog, the rail list, and the composer popup."""
+        dirs = [self.skill_store.global_dir]
+        if workspace:
+            dirs.append(self.skill_store.project_dir(workspace))
+        loader = SkillLoader(dirs)
+        return effective_skills(
+            names=set(loader.names()),
+            disabled=self.skill_store.disabled_names(),
+            session_overrides=self.session_skills.get(session_id),
+        )
+
+    def session_skills_view(
+        self, session_id: str, workspace: Optional[str] = None
+    ) -> dict[str, Any]:
+        """The rail payload: every in-scope, Settings-enabled skill with its mute state."""
+        disabled = self.skill_store.disabled_names()
+        overrides = self.session_skills.get(session_id)
+        rows = [
+            {
+                "name": r["name"],
+                "description": r["description"],
+                "scope": r["scope"],
+                "enabled": overrides.get(r["name"], True),
+            }
+            for r in self.skill_store.rows(workspace or None)
+            if r["name"] not in disabled
+        ]
+        return {"skills": rows}
+
+    def _scratch_workspace_error(self, workspace: Any) -> Optional[dict[str, Any]]:
+        """Refuse skill WRITES into a per-conversation scratch dir — a skill saved there is
+        stranded in a throwaway folder. Backend chokepoint: guards every entry path (UI,
+        REST, future import), not just the flows the GUI happens to gate."""
+        if not workspace:
+            return None
+        try:
+            ws = Path(str(workspace)).expanduser().resolve()
+            if ws.is_relative_to(self.scratch_base().resolve()):
+                return {
+                    "ok": False,
+                    "error": (
+                        "That folder is a temporary session space — skills saved there "
+                        "would be lost. Save it globally or pick a real project."
+                    ),
+                }
+        except OSError:
+            pass
+        return None
+
+    def create_skill(self, body: dict[str, Any]) -> dict[str, Any]:
+        blocked = self._scratch_workspace_error(body.get("workspace"))
+        if blocked:
+            return blocked
+        try:
+            created = self.skill_store.create(
+                name=str(body.get("name", "")),
+                description=str(body.get("description", "")),
+                instructions=str(body.get("instructions", "")),
+                scope=str(body.get("scope", "global") or "global"),
+                workspace=body.get("workspace") or None,
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "skill": created}
+
+    def update_skill(self, name: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            if "enabled" in body:
+                self.skill_store.set_enabled(name, bool(body["enabled"]))
+            if body.get("description") is not None or body.get("instructions") is not None:
+                self.skill_store.update(
+                    name,
+                    description=body.get("description"),
+                    instructions=body.get("instructions"),
+                    workspace=body.get("workspace") or None,
+                )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def delete_skill(self, name: str, workspace: Optional[str] = None) -> dict[str, Any]:
+        try:
+            self.skill_store.delete(name, workspace or None)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True}
+
+    def move_skill(self, name: str, body: dict[str, Any]) -> dict[str, Any]:
+        # Moving INTO project scope must not target a scratch dir (moving OUT is fine —
+        # that's the rescue path for already-stranded skills).
+        if str(body.get("scope", "")) == "project":
+            blocked = self._scratch_workspace_error(body.get("workspace"))
+            if blocked:
+                return blocked
+        try:
+            moved = self.skill_store.move(
+                name,
+                to_scope=str(body.get("scope", "")),
+                workspace=body.get("workspace") or None,
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "skill": moved}
+
+    def stage_skill_upload(self, data: bytes, filename: str = "") -> dict[str, Any]:
+        try:
+            preview = self.skill_store.stage_upload(data, filename)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, **preview}
+
+    def confirm_skill_upload(self, body: dict[str, Any]) -> dict[str, Any]:
+        blocked = self._scratch_workspace_error(body.get("workspace"))
+        if blocked:
+            return blocked
+        try:
+            saved = self.skill_store.confirm_upload(
+                str(body.get("token", "")),
+                scope=str(body.get("scope", "global") or "global"),
+                workspace=body.get("workspace") or None,
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "skill": saved}
+
+    def _memory_saved_notifier(self, session_id: str):
+        """MEMORY-SPEC §5.1: push the memory_saved event that powers the GUI's save
+        toast ("I'll remember that — … [Undo]"). Best-effort by design: `remember` may
+        run with no socket attached (background runs) or off the loop thread — a lost
+        toast never fails the save."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        def notify(item, previous=None) -> None:
+            if loop is None or not loop.is_running():
+                return
+            payload = {
+                "type": "memory_saved",
+                "data": {
+                    "id": item.id,
+                    "scope": item.scope.value,
+                    "summary": item.summary or "",
+                    "content": item.content,
+                    # Set when this was an EDIT of an existing memory: the surface says
+                    # "I've updated what I remember" and Undo restores this text.
+                    "previous": previous or "",
+                },
+            }
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.broadcast_session(session_id, payload), loop
+                )
+            except RuntimeError:
+                pass
+
+        return notify
 
     def list_memory(self) -> list[dict[str, Any]]:
         return [
-            {"id": m.id, "scope": m.scope.value, "content": m.content}
+            {
+                "id": m.id,
+                "scope": m.scope.value,
+                "content": m.content,
+                "summary": m.summary or "",
+                "created_at": m.created_at or "",
+            }
             for m in self.memory_store.list()
         ]
 
     def add_memory(
         self, content: str, scope: str = "workspace", workspace: Optional[str] = None
     ) -> dict[str, Any]:
+        content = (content or "").strip()
+        if not content:
+            return {"ok": False, "error": "content required"}
         chosen = Scope(scope) if scope in _SCOPES else Scope.WORKSPACE
         ws = self.resolve_workspace(workspace) if chosen is Scope.WORKSPACE else None
         item = self.memory_store.add(content, scope=chosen, workspace=ws)
         return {"id": item.id, "scope": item.scope.value, "content": item.content}
+
+    def update_memory(self, item_id: int, content: str) -> dict[str, Any]:
+        """Edit-in-place from the memory screen (§5.3). The user rewrote the fact, so
+        the stale one-line summary is cleared rather than left contradicting it."""
+        content = (content or "").strip()
+        if not content:
+            return {"ok": False, "error": "content required"}
+        item = self.memory_store.update(item_id, content, summary="")
+        if item is None:
+            return {"ok": False, "error": f"no memory with id {item_id}"}
+        return {"ok": True, "id": item.id, "content": item.content}
+
+    def delete_memory(self, item_id: int) -> dict[str, Any]:
+        """Row delete on the memory screen — and the toast's Undo (§5.1)."""
+        if self.memory_store.delete(item_id):
+            return {"ok": True, "id": item_id}
+        return {"ok": False, "error": f"no memory with id {item_id}"}
+
+    def delete_all_memory(self) -> dict[str, Any]:
+        return {"ok": True, "deleted": self.memory_store.delete_all()}
+
+    def get_memory_settings(self) -> dict[str, Any]:
+        return self.memory_settings.snapshot()
+
+    def set_memory_settings(
+        self, enabled: Optional[bool] = None, user_rules: Optional[str] = None
+    ) -> dict[str, Any]:
+        return self.memory_settings.set(enabled=enabled, user_rules=user_rules)
 
 
 def _parse_inbox_json(s: str) -> dict[str, Any]:
