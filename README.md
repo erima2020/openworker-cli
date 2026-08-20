@@ -1,10 +1,10 @@
-# OpenWorker
+# OpenWorker-CLI
 
-OpenWorker is a local-first AI coworker that runs from the terminal. It can work with files, shell commands, web tools, memory, skills, MCP servers, connectors, and scheduled automations while asking for approval before consequential actions.
+OpenWorker-CLI is an AI coworker that runs from the terminal. It can work with files, shell commands, web tools, memory, skills, MCP servers, connectors, and scheduled automations while asking for approval before consequential actions.
 
-The GUI has been removed from this checkout. The supported surfaces are the terminal CLI and the optional local API server.
+The GUI has been replaced by a CLI in this version (see https://github.com/andrewyng/openworker for the original with a GUI). The supported surfaces are the terminal CLI and the optional local API server.
 
-> **Development note:** The changes in this checkout were made mostly autonomously by the Claude Code CLI using GPT-5.6 Luna by OpenAI. AI-assisted software can contain mistakes, omissions, or security issues; review and test changes carefully before relying on them in production.
+> **Development note:** The changes in this checkout were made mostly autonomously by the Claude Code CLI using GPT-5.6 Luna by OpenAI. AI-assisted software can contain mistakes, omissions, or security issues. This experimental version is not aimed for use in production.
 
 ## Default model
 
@@ -21,18 +21,18 @@ The model is accessed through Ollama's OpenAI-compatible local API. Other provid
 Prerequisites: Python 3.10+ and [Ollama](https://ollama.com/).
 
 ```shell
-cd /Users/emay/Downloads/openworker
+cd /Users/Username/Downloads/openworker
 bash packaging/setup_dev_env.sh
 ollama serve
 ollama pull gemma4:31b-cloud
-.venv/bin/openworker --cwd /Users/emay/Downloads
+.venv/bin/openworker --cwd /Users/Username/Downloads
 ```
 
 From another directory:
 
 ```shell
-/Users/emay/Downloads/openworker/.venv/bin/openworker \
-  --cwd /Users/emay/Downloads
+/Users/Username/Downloads/openworker/.venv/bin/openworker \
+  --cwd /Users/Username/Downloads
 ```
 
 Override the model:
