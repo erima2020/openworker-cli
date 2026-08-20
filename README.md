@@ -4,6 +4,8 @@ OpenWorker is a local-first AI coworker that runs from the terminal. It can work
 
 The GUI has been removed from this checkout. The supported surfaces are the terminal CLI and the optional local API server.
 
+> **Development note:** The changes in this checkout were made mostly autonomously by the Claude Code CLI using GPT-5.6 Luna by OpenAI. AI-assisted software can contain mistakes, omissions, or security issues; review and test changes carefully before relying on them in production.
+
 ## Default model
 
 The default model is:
